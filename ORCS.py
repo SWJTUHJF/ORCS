@@ -44,14 +44,14 @@ class Link:
     def update_marginal_cost(self) -> None:
         self.marginal_cost = (self.fft * (1 + self.alpha * ((self.ue_flow + self.so_flow) / self.capacity) ** self.beta)
                               + self.fft * self.alpha * self.beta * (
-                              (self.ue_flow + self.so_flow) / self.capacity) ** self.beta)
+                                      (self.ue_flow + self.so_flow) / self.capacity) ** self.beta)
 
     def get_cost(self, ue_param, so_param) -> float:
-        return self.fft * (1 + self.alpha * ((ue_param+so_param) / self.capacity) ** self.beta)
+        return self.fft * (1 + self.alpha * ((ue_param + so_param) / self.capacity) ** self.beta)
 
     def get_marginal_cost(self, ue_param, so_param) -> float:
-        return (self.fft * (1 + self.alpha * ((ue_param+so_param) / self.capacity) ** self.beta)
-                + self.fft * self.alpha * self.beta * ((ue_param+so_param) / self.capacity) ** self.beta)
+        return (self.fft * (1 + self.alpha * ((ue_param + so_param) / self.capacity) ** self.beta)
+                + self.fft * self.alpha * self.beta * ((ue_param + so_param) / self.capacity) ** self.beta)
 
 
 class ODPair:
@@ -60,7 +60,7 @@ class ODPair:
         self.destination: Node = destination
         self.total_demand: float = demand
         self.ue_demand: float = 0
-        self.so_demand: float = 0  # TODO
+        self.so_demand: float = 0
 
     def __repr__(self):
         return f'ODPair {self.origin.node_id}->{self.destination.node_id}={self.total_demand}'
@@ -136,7 +136,7 @@ class MixedEquilibrium:
         self.TSTT: float = 0
 
     # Main method, return the total system travel time
-    def run(self) -> float:
+    def run(self) -> tuple[float, np.ndarray, np.ndarray]:
         # Initialize
         iteration, cur_ue_gap, cur_so_gap = 0, inf, inf
         self.initialize()
@@ -155,8 +155,10 @@ class MixedEquilibrium:
                 link.ue_flow += optimal_step * ue_search_dir[i]
                 link.so_flow += optimal_step * so_search_dir[i]
             iteration += 1
-        return sum([(link.cost * (link.so_flow + link.ue_flow))
-                    for link in self.network.Links[1:]])
+        total_travel_time = sum([(link.cost * (link.so_flow + link.ue_flow)) for link in self.network.Links[1:]])
+        ue_flow_pattern = np.array([link.ue_flow for link in self.network.Links[1:]])
+        so_flow_pattern = np.array([link.so_flow for link in self.network.Links[1:]])
+        return total_travel_time, ue_flow_pattern, so_flow_pattern
 
     # Load the SO and UE flow; Initialize cost and marginal cost; Initialize the link flow based on all-or-nothing.
     def initialize(self):
@@ -205,7 +207,6 @@ class MixedEquilibrium:
             SPTT += min_dist * od.ue_demand
         TSTT = sum([link.ue_flow * link.cost for link in self.network.Links[1:]])
         return (TSTT / SPTT) - 1
-
 
     def check_so_convergence(self) -> float:
         if sum([od.so_demand for od in self.network.ODPairs]) == 0:
@@ -291,26 +292,77 @@ class MixedEquilibrium:
         return shortest_path
 
 
-class ADMM:
+class ORCS:
     def __init__(self, network, control_intensity, penalty_param, control_potential, gap1, gap2, gap3, gap4, max_iter1,
                  max_iter2, max_iter3, max_iter4):
-        self.network = network
-        self.control_intensity = control_intensity
-        self.penalty_param = penalty_param
-        self.control_potential = control_potential
-        self.gap1 = gap1
-        self.gap2 = gap2
-        self.gap3 = gap3
-        self.gap4 = gap4
-        self.max_iter1 = max_iter1
-        self.max_iter2 = max_iter2
-        self.max_iter3 = max_iter3
-        self.max_iter4 = max_iter4
+        self.network: Network = network
+        self.control_intensity: float = control_intensity
+        self.penalty_param: float = penalty_param
+        self.control_potential: float = control_potential
+        self.gap1: float = gap1
+        self.gap2: float = gap2
+        self.gap3: float = gap3
+        self.gap4: float = gap4
+        self.max_iter1: int = max_iter1
+        self.max_iter2: int = max_iter2
+        self.max_iter3: int = max_iter3
+        self.max_iter4: int = max_iter4
+
+    def run(self):
+        iteration, cur_gap3 = 0, inf
+        shifted_flow = np.array([0 for _ in range(len(self.network.ODPairs))])
+        ue_demand = np.array([od.ue_demand for od in self.network.ODPairs])
+        so_demand = np.array([0 for _ in range(len(self.network.ODPairs))])
+        lp = MixedEquilibrium(self.network, ue_demand, so_demand, self.gap1, self.gap2, self.max_iter1, self.max_iter2)
+        _, ue_flow, so_flow = lp.run()
+        while iteration < self.max_iter3 and cur_gap3 > self.gap3:
+            for link in self.network.Links[1:]:
+                link.update_cost()
+                link.update_marginal_cost()
+            gradient = list()
+            for od in self.network.ODPairs:
+                origin, destination = od.origin.node_id, od.destination.node_id
+                ue_mc = sum([link.marginal_cost for link in lp.dijkstra(origin, destination, marginal=False)])
+                so_mc = sum([link.marginal_cost for link in lp.dijkstra(origin, destination, marginal=True)])
+                gradient.append(so_mc-ue_mc)
+            gradient = np.array(gradient)
+            ADMM_iteration, cur_gap1, cur_gap2 = 0, inf, inf
+            c = np.array([0 for _ in range(len(self.network.ODPairs))])
+            u = np.array([0 for _ in range(len(self.network.ODPairs))])
+            while ADMM_iteration < self.max_iter4 and (cur_gap1 > self.gap4 or cur_gap2 > self.gap4):
+                new_shifted_flow = c - u - gradient / self.penalty_param
+                new_c = list()
+                for i, od in enumerate(self.network.ODPairs):
+                    temp1 = new_shifted_flow[i] + u[i]
+                    temp2 = self.control_intensity / self.penalty_param
+                    max_flow_shifted = od.total_demand*self.control_potential
+                    min_flow_shifted = 0.0
+                    if temp1 > temp2:
+                        new_c.append(min(max_flow_shifted, float(temp1-temp2)))
+                    elif -temp2 < temp1 < temp2:
+                        new_c.append(0)
+                    else:
+                        new_c.append(max(min_flow_shifted, float(temp1+temp2)))
+                new_c = np.array(new_c)
+                new_u = u + new_shifted_flow - new_c
+                cur_gap1 = sum([abs(new_shifted_flow[i] - new_c[i]) for i in range(len(self.network.ODPairs))])
+                cur_gap2 = sum([abs(new_c[i] - c[i]) for i in range(len(self.network.ODPairs))])
+                c = new_c
+                u = new_u  # TODO: if need copy?
+                shifted_flow = new_shifted_flow
+                ADMM_iteration += 1
+            ue_demand -= shifted_flow
+            so_demand += shifted_flow
+            lp = MixedEquilibrium(self.network, ue_demand, so_demand, self.gap1, self.gap2, self.max_iter1,
+                                  self.max_iter2)
+            _, ue_flow, so_flow = lp.run()
+            cur_gap3 = sum([abs(ele) for ele in shifted_flow])
+            # TODO: Something about q is mixed up.
 
 
 if __name__ == '__main__':
     sf = Network("SiouxFalls")
-    model = ADMM(network=sf,
+    model = ORCS(network=sf,
                  control_intensity=0.1,
                  penalty_param=1,
                  control_potential=1,
@@ -322,10 +374,14 @@ if __name__ == '__main__':
                  max_iter2=1000,
                  max_iter3=1000,
                  max_iter4=1000)
-    demand_pattern = np.array([od.total_demand for od in sf.ODPairs])
-    s = time.perf_counter()
-    lower = MixedEquilibrium(network=sf, so_demand = demand_pattern * 0.5, ue_demand = demand_pattern * 0.5,
-                             ue_gap=1e-4, so_gap=1e-4, FW_max_iter=2000, LS_max_iter=2000)
-    print(lower.run())
-    e = time.perf_counter()
-    print(e-s)
+    model.run()
+    # demand_pattern = np.array([od.total_demand for od in sf.ODPairs])
+    # s = time.perf_counter()
+    # lower1 = MixedEquilibrium(network=sf, so_demand=demand_pattern * 0, ue_demand=demand_pattern,
+    #                           ue_gap=1e-4, so_gap=1e-4, FW_max_iter=2000, LS_max_iter=2000)
+    # lower2 = MixedEquilibrium(network=sf, so_demand=demand_pattern, ue_demand=demand_pattern * 0,
+    #                           ue_gap=1e-4, so_gap=1e-4, FW_max_iter=2000, LS_max_iter=2000)
+    # print(lower1.run())
+    # print(lower2.run())
+    # e = time.perf_counter()
+    # print(e - s)
