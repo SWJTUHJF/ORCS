@@ -1,0 +1,14 @@
+# 忽略 Python 缓存目录  
+__pycache__/  
+
+# 忽略 JetBrains IDE 配置目录  
+.idea/
+
+# 忽略.xlsx文件
+*.xlsx
+
+# 忽略Results下的文件
+Results/
+
+# 忽略test文件
+*test*
