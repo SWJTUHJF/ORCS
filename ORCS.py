@@ -1,4 +1,5 @@
 import re
+import time
 import numpy as np
 from math import inf
 
@@ -41,15 +42,16 @@ class Link:
         self.cost = self.fft * (1 + self.alpha * ((self.ue_flow + self.so_flow) / self.capacity) ** self.beta)
 
     def update_marginal_cost(self) -> None:
-        self.cost = (self.fft * (1 + self.alpha * ((self.ue_flow + self.so_flow) / self.capacity) ** self.beta)
-         + self.fft * self.alpha * self.beta * ((self.ue_flow + self.so_flow) / self.capacity) ** self.beta)
+        self.marginal_cost = (self.fft * (1 + self.alpha * ((self.ue_flow + self.so_flow) / self.capacity) ** self.beta)
+                              + self.fft * self.alpha * self.beta * (
+                              (self.ue_flow + self.so_flow) / self.capacity) ** self.beta)
 
-    def get_cost(self, param) -> float:
-        return self.fft * (1 + self.alpha * (param / self.capacity) ** self.beta)
+    def get_cost(self, ue_param, so_param) -> float:
+        return self.fft * (1 + self.alpha * ((ue_param+so_param) / self.capacity) ** self.beta)
 
-    def get_marginal_cost(self, param) -> float:
-        return (self.fft * (1 + self.alpha * (param / self.capacity) ** self.beta)
-                + self.fft * self.alpha * self.beta * (param / self.capacity) ** self.beta)
+    def get_marginal_cost(self, ue_param, so_param) -> float:
+        return (self.fft * (1 + self.alpha * ((ue_param+so_param) / self.capacity) ** self.beta)
+                + self.fft * self.alpha * self.beta * ((ue_param+so_param) / self.capacity) ** self.beta)
 
 
 class ODPair:
@@ -77,7 +79,7 @@ class Network:
         self.read_OD()
 
     def read_network(self):
-        path = f'TransportationNetworks\\{self.name}\\{self.name}_net.txt'
+        path = f'D:\\TransportationNetworks\\{self.name}\\{self.name}_net.txt'
         with open(path, 'r', encoding='UTF-8') as file:
             lines = file.readlines()
         pattern = re.compile(r'[\w.~]+')
@@ -91,13 +93,13 @@ class Network:
         self.Links = [Link(0)]
         for index, line in enumerate(data):
             cur_link = Link(index + 1, self.Nodes[int(line[0])], self.Nodes[int(line[1])], float(line[2]),
-                        float(line[3]), float(line[4]), float(line[5]), float(line[6]))
+                            float(line[3]), float(line[4]), float(line[5]), float(line[6]))
             self.Links.append(cur_link)
             self.Nodes[int(line[0])].downstream_link.append(cur_link)
             self.Nodes[int(line[1])].upstream_link.append(cur_link)
 
     def read_OD(self):
-        path = f'TransportationNetworks\\{self.name}\\{self.name}_trips.txt'
+        path = f'D:\\TransportationNetworks\\{self.name}\\{self.name}_trips.txt'
         with open(path, 'r', encoding='UTF-8') as file:
             # Process the text file
             lines = file.readlines()
@@ -123,49 +125,131 @@ class Network:
 
 
 class MixedEquilibrium:
-    def __init__(self, network, ue_demand, so_demand, gap1, gap2, max_iter1, max_iter2):
+    def __init__(self, network, ue_demand, so_demand, ue_gap, so_gap, FW_max_iter, LS_max_iter):
         self.network: Network = network
         self.ue_demand: list[float] = ue_demand
         self.so_demand: list[float] = so_demand
-        self.gap1: float = gap1
-        self.gap2: float = gap2
-        self.max_iter1: int = max_iter1
-        self.max_iter2: int = max_iter2
+        self.ue_gap: float = ue_gap
+        self.so_gap: float = so_gap
+        self.FW_max_iter: int = FW_max_iter  # FW algorithm convergence gap
+        self.LS_max_iter: int = LS_max_iter  # Line search convergence gap
+        self.TSTT: float = 0
 
+    # Main method, return the total system travel time
+    def run(self) -> float:
+        # Initialize
+        iteration, cur_ue_gap, cur_so_gap = 0, inf, inf
+        self.initialize()
+        while iteration < self.FW_max_iter and (cur_ue_gap > self.ue_gap or cur_so_gap > self.so_gap):
+            # All or nothing assignment for UE users
+            ue_search_dir = self.all_or_nothing_ue()
+            # All or nothing assignment for SO users
+            so_search_dir = self.all_or_nothing_so()
+            # Check convergence for every 200 iterations to improve efficiency
+            if iteration % 200 == 0:
+                cur_ue_gap = self.check_ue_convergence()
+                cur_so_gap = self.check_so_convergence()
+            # Line search
+            optimal_step = self.line_search(ue_search_dir, so_search_dir)
+            for i, link in enumerate(self.network.Links[1:]):
+                link.ue_flow += optimal_step * ue_search_dir[i]
+                link.so_flow += optimal_step * so_search_dir[i]
+            iteration += 1
+        return sum([(link.cost * (link.so_flow + link.ue_flow))
+                    for link in self.network.Links[1:]])
 
+    # Load the SO and UE flow; Initialize cost and marginal cost; Initialize the link flow based on all-or-nothing.
     def initialize(self):
         for index, od in enumerate(self.network.ODPairs):
             od.ue_demand = self.ue_demand[index]
             od.so_demand = self.so_demand[index]
         for link in self.network.Links[1:]:
+            link.ue_flow, link.so_flow = 0, 0
             link.update_cost()
             link.update_marginal_cost()
+        self.all_or_nothing_so()
+        self.all_or_nothing_ue()
+        for link in self.network.Links[1:]:
+            link.ue_flow = link.auxiliary_ue_flow
+            link.so_flow = link.auxiliary_so_flow
 
-    def main(self):
-        pass
-
-    def all_or_nothing_ue(self):
+    def all_or_nothing_ue(self) -> np.ndarray:
         for link in self.network.Links[1:]:
             link.update_cost()
+            link.auxiliary_ue_flow = 0
         for od in self.network.ODPairs:
             origin, destination, ue_demand = od.origin.node_id, od.destination.node_id, od.ue_demand
             shortest_path = self.dijkstra(origin, destination, marginal=False)
             for link in shortest_path:
                 link.auxiliary_ue_flow += ue_demand
+        return np.array([(link.auxiliary_ue_flow - link.ue_flow) for link in self.network.Links[1:]])
 
-    def all_or_nothing_so(self):
+    def all_or_nothing_so(self) -> np.ndarray:
         for link in self.network.Links[1:]:
             link.update_marginal_cost()
+            link.auxiliary_so_flow = 0
         for od in self.network.ODPairs:
             origin, destination, so_demand = od.origin.node_id, od.destination.node_id, od.so_demand
-            shortest_path = self.dijkstra(origin, destination, marginal=False)
+            shortest_path = self.dijkstra(origin, destination, marginal=True)
             for link in shortest_path:
                 link.auxiliary_so_flow += so_demand
+        return np.array([(link.auxiliary_so_flow - link.so_flow) for link in self.network.Links[1:]])
+
+    def check_ue_convergence(self) -> float:
+        if sum([od.ue_demand for od in self.network.ODPairs]) == 0:
+            return -1
+        SPTT = 0
+        for od in self.network.ODPairs:
+            min_path = self.dijkstra(od.origin.node_id, od.destination.node_id, marginal=False)
+            min_dist = sum([link.cost for link in min_path])
+            SPTT += min_dist * od.ue_demand
+        TSTT = sum([link.ue_flow * link.cost for link in self.network.Links[1:]])
+        return (TSTT / SPTT) - 1
+
+
+    def check_so_convergence(self) -> float:
+        if sum([od.so_demand for od in self.network.ODPairs]) == 0:
+            return -1
+        SPTT = 0
+        for od in self.network.ODPairs:
+            min_path = self.dijkstra(od.origin.node_id, od.destination.node_id, marginal=True)
+            min_dist = sum([link.marginal_cost for link in min_path])
+            SPTT += min_dist * od.so_demand
+        TSTT = sum([link.so_flow * link.marginal_cost for link in self.network.Links[1:]])
+        return (TSTT / SPTT) - 1
+
+    def line_search(self, ue_dir, so_dir) -> float:
+        iteration_ls, left, right, mid = 0, 0, 1, 0.5
+        ue_flow_vector = np.array([link.ue_flow for link in self.network.Links[1:]])
+        so_flow_vector = np.array([link.so_flow for link in self.network.Links[1:]])
+        ue_flow_alpha = ue_flow_vector + mid * ue_dir
+        so_flow_alpha = so_flow_vector + mid * so_dir
+        cost_alpha = np.array([link.get_cost(ue_flow_alpha[i], so_flow_alpha[i])
+                               for i, link in enumerate(self.network.Links[1:])])
+        marginal_cost_alpha = np.array([link.get_marginal_cost(ue_flow_alpha[i], so_flow_alpha[i])
+                                        for i, link in enumerate(self.network.Links[1:])])
+        sigma = np.dot(cost_alpha, ue_dir) + np.dot(marginal_cost_alpha, so_dir)
+        while (iteration_ls < self.LS_max_iter and (right - left) > self.so_gap) or sigma > 0:
+            if sigma < 0:
+                left = mid
+            else:
+                right = mid
+            mid = 0.5 * (right + left)
+            ue_flow_alpha = ue_flow_vector + mid * ue_dir
+            so_flow_alpha = so_flow_vector + mid * so_dir
+            cost_alpha = np.array([link.get_cost(ue_flow_alpha[i], so_flow_alpha[i])
+                                   for i, link in enumerate(self.network.Links[1:])])
+            marginal_cost_alpha = np.array([link.get_marginal_cost(ue_flow_alpha[i], so_flow_alpha[i])
+                                            for i, link in enumerate(self.network.Links[1:])])
+            sigma = np.dot(cost_alpha, ue_dir) + np.dot(marginal_cost_alpha, so_dir)
+            iteration_ls += 1
+        return mid
 
     """
     Find the shortest path based on the cost or the marginal cost.
-    Set marginal=False for the former or marginal=True for the latter.
+    Set `marginal=False` for the former and `marginal=True` for the latter.
     """
+
     def dijkstra(self, o_id: int, d_id: int, marginal: bool) -> list[Link]:
         # initialize
         for node in self.network.Nodes:
@@ -200,12 +284,11 @@ class MixedEquilibrium:
                     temp = link
                     break
             else:
-                return None
+                raise ValueError("No shortest path is found.")
             shortest_path.append(temp)
             cur_node = p
         shortest_path.reverse()
         return shortest_path
-
 
 
 class ADMM:
@@ -239,6 +322,10 @@ if __name__ == '__main__':
                  max_iter2=1000,
                  max_iter3=1000,
                  max_iter4=1000)
-    lower = MixedEquilibrium(sf, [100]*528, [100]*528, 1e-4, 1e-4, 1000, 1000)
-    lower.initialize()
-    print(lower.dijkstra(1, 24, marginal=True))
+    demand_pattern = np.array([od.total_demand for od in sf.ODPairs])
+    s = time.perf_counter()
+    lower = MixedEquilibrium(network=sf, so_demand = demand_pattern * 0.5, ue_demand = demand_pattern * 0.5,
+                             ue_gap=1e-4, so_gap=1e-4, FW_max_iter=2000, LS_max_iter=2000)
+    print(lower.run())
+    e = time.perf_counter()
+    print(e-s)
