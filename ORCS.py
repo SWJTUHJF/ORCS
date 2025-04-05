@@ -155,6 +155,7 @@ class MixedEquilibrium:
                 link.ue_flow += optimal_step * ue_search_dir[i]
                 link.so_flow += optimal_step * so_search_dir[i]
             iteration += 1
+
         total_travel_time = sum([(link.cost * (link.so_flow + link.ue_flow)) for link in self.network.Links[1:]])
         ue_flow_pattern = np.array([link.ue_flow for link in self.network.Links[1:]])
         so_flow_pattern = np.array([link.so_flow for link in self.network.Links[1:]])
@@ -309,12 +310,13 @@ class ORCS:
         self.max_iter4: int = max_iter4
 
     def run(self):
-        iteration, cur_gap3 = 0, inf
-        shifted_flow = np.array([0 for _ in range(len(self.network.ODPairs))])
-        ue_demand = np.array([od.ue_demand for od in self.network.ODPairs])
-        so_demand = np.array([0 for _ in range(len(self.network.ODPairs))])
+        iteration, cur_gap3, num_od = 0, inf, len(self.network.ODPairs)
+        shifted_flow = np.array([0.0 for _ in range(num_od)])
+        ue_demand = np.array([od.total_demand for od in self.network.ODPairs])
+        so_demand = np.array([0.0 for _ in range(num_od)])
         lp = MixedEquilibrium(self.network, ue_demand, so_demand, self.gap1, self.gap2, self.max_iter1, self.max_iter2)
-        _, ue_flow, so_flow = lp.run()
+        tstt, ue_flow, so_flow = lp.run()
+        print(tstt)
         while iteration < self.max_iter3 and cur_gap3 > self.gap3:
             for link in self.network.Links[1:]:
                 link.update_cost()
@@ -325,17 +327,18 @@ class ORCS:
                 ue_mc = sum([link.marginal_cost for link in lp.dijkstra(origin, destination, marginal=False)])
                 so_mc = sum([link.marginal_cost for link in lp.dijkstra(origin, destination, marginal=True)])
                 gradient.append(so_mc-ue_mc)
-            gradient = np.array(gradient)
+            gradient = np.array(gradient)  # TODO: check from here
             ADMM_iteration, cur_gap1, cur_gap2 = 0, inf, inf
-            c = np.array([0 for _ in range(len(self.network.ODPairs))])
-            u = np.array([0 for _ in range(len(self.network.ODPairs))])
+            c = np.array([0.0 for _ in range(num_od)])
+            u = np.array([0.0 for _ in range(num_od)])
+            new_shifted_flow = c - u - gradient / self.penalty_param
             while ADMM_iteration < self.max_iter4 and (cur_gap1 > self.gap4 or cur_gap2 > self.gap4):
                 new_shifted_flow = c - u - gradient / self.penalty_param
                 new_c = list()
                 for i, od in enumerate(self.network.ODPairs):
                     temp1 = new_shifted_flow[i] + u[i]
                     temp2 = self.control_intensity / self.penalty_param
-                    max_flow_shifted = od.total_demand*self.control_potential
+                    max_flow_shifted = od.total_demand * self.control_potential
                     min_flow_shifted = 0.0
                     if temp1 > temp2:
                         new_c.append(min(max_flow_shifted, float(temp1-temp2)))
@@ -345,19 +348,28 @@ class ORCS:
                         new_c.append(max(min_flow_shifted, float(temp1+temp2)))
                 new_c = np.array(new_c)
                 new_u = u + new_shifted_flow - new_c
-                cur_gap1 = sum([abs(new_shifted_flow[i] - new_c[i]) for i in range(len(self.network.ODPairs))])
-                cur_gap2 = sum([abs(new_c[i] - c[i]) for i in range(len(self.network.ODPairs))])
+                cur_gap1 = sum(abs(a - b) for a, b in zip(new_shifted_flow, new_c))
+                cur_gap2 = sum(abs(a - b) for a, b in zip(new_c, c))
                 c = new_c
-                u = new_u  # TODO: if need copy?
-                shifted_flow = new_shifted_flow
+                u = new_u
                 ADMM_iteration += 1
-            ue_demand -= shifted_flow
-            so_demand += shifted_flow
+            ue_demand -= new_shifted_flow
+            so_demand += new_shifted_flow
             lp = MixedEquilibrium(self.network, ue_demand, so_demand, self.gap1, self.gap2, self.max_iter1,
                                   self.max_iter2)
-            _, ue_flow, so_flow = lp.run()
-            cur_gap3 = sum([abs(ele) for ele in shifted_flow])
-            # TODO: Something about q is mixed up.
+            tstt, ue_flow, so_flow = lp.run()
+            cur_gap3 = sum(map(abs, new_shifted_flow))
+            shifted_flow += new_shifted_flow
+            iteration += 1
+            print(f'iteration {iteration}, cur_gap3 = {cur_gap3}, tstt = {tstt}')
+        ue_total_flow = sum([link.ue_flow for link in self.network.Links[1:]])
+        so_total_flow = sum([link.so_flow for link in self.network.Links[1:]])
+        print(so_total_flow / (so_total_flow + ue_total_flow))
+
+
+"""
+Something is wrong with the shifted_flow: for one od pair, either all demand is controlled or none is controlled
+"""
 
 
 if __name__ == '__main__':
@@ -370,9 +382,9 @@ if __name__ == '__main__':
                  gap2=1e-4,
                  gap3=1e-4,
                  gap4=1e-4,
-                 max_iter1=1000,
-                 max_iter2=1000,
-                 max_iter3=1000,
+                 max_iter1=2000,
+                 max_iter2=2000,
+                 max_iter3=3000,
                  max_iter4=1000)
     model.run()
     # demand_pattern = np.array([od.total_demand for od in sf.ODPairs])
