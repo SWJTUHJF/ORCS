@@ -338,7 +338,8 @@ class ORCS:
                 for i, od in enumerate(self.network.ODPairs):
                     temp1 = new_shifted_flow[i] + u[i]
                     temp2 = self.control_intensity / self.penalty_param
-                    max_flow_shifted = od.total_demand * self.control_potential
+                    # max_flow_shifted = od.total_demand * self.control_potential
+                    max_flow_shifted = od.ue_demand - float(shifted_flow[i])  # TODO: check corectness
                     min_flow_shifted = 0.0
                     if temp1 > temp2:
                         new_c.append(min(max_flow_shifted, float(temp1-temp2)))
@@ -346,7 +347,6 @@ class ORCS:
                         new_c.append(0)
                     else:
                         new_c.append(max(min_flow_shifted, float(temp1+temp2)))
-                new_c = np.array(new_c)
                 new_u = u + new_shifted_flow - new_c
                 cur_gap1 = sum(abs(a - b) for a, b in zip(new_shifted_flow, new_c))
                 cur_gap2 = sum(abs(a - b) for a, b in zip(new_c, c))
@@ -389,12 +389,11 @@ if __name__ == '__main__':
                  max_iter4=1000)
     model.run()
     # demand_pattern = np.array([od.total_demand for od in sf.ODPairs])
-    # s = time.perf_counter()
-    # lower1 = MixedEquilibrium(network=sf, so_demand=demand_pattern * 0, ue_demand=demand_pattern,
-    #                           ue_gap=1e-4, so_gap=1e-4, FW_max_iter=2000, LS_max_iter=2000)
-    # lower2 = MixedEquilibrium(network=sf, so_demand=demand_pattern, ue_demand=demand_pattern * 0,
-    #                           ue_gap=1e-4, so_gap=1e-4, FW_max_iter=2000, LS_max_iter=2000)
-    # print(lower1.run())
-    # print(lower2.run())
-    # e = time.perf_counter()
-    # print(e - s)
+    # for i in [0.1*j for j in range(11)]:
+    #     s = time.perf_counter()
+    #     lower1 = MixedEquilibrium(network=sf, so_demand=demand_pattern * i, ue_demand=demand_pattern * (1 - i),
+    #                               ue_gap=1e-4, so_gap=1e-4, FW_max_iter=1000, LS_max_iter=2000)
+    #     tstt, _, _ = lower1.run()
+    #     print(tstt)
+    #     e = time.perf_counter()
+    #     print(e - s)
