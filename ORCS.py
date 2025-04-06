@@ -327,13 +327,13 @@ class ORCS:
                 ue_mc = sum([link.marginal_cost for link in lp.dijkstra(origin, destination, marginal=False)])
                 so_mc = sum([link.marginal_cost for link in lp.dijkstra(origin, destination, marginal=True)])
                 gradient.append(so_mc-ue_mc)
-            gradient = np.array(gradient)  # TODO: check from here
+            gradient = np.array(gradient)
             ADMM_iteration, cur_gap1, cur_gap2 = 0, inf, inf
             c = np.array([0.0 for _ in range(num_od)])
             u = np.array([0.0 for _ in range(num_od)])
             new_shifted_flow = c - u - gradient / self.penalty_param
             while ADMM_iteration < self.max_iter4 and (cur_gap1 > self.gap4 or cur_gap2 > self.gap4):
-                new_shifted_flow = c - u - gradient / self.penalty_param
+                new_shifted_flow = c - u - gradient / self.penalty_param  # TODO: NSF increases all the time
                 new_c = list()
                 for i, od in enumerate(self.network.ODPairs):
                     temp1 = new_shifted_flow[i] + u[i]
@@ -342,7 +342,7 @@ class ORCS:
                     min_flow_shifted = 0.0
                     if temp1 > temp2:
                         new_c.append(min(max_flow_shifted, float(temp1-temp2)))
-                    elif -temp2 < temp1 < temp2:
+                    elif -temp2 <= temp1 <= temp2:
                         new_c.append(0)
                     else:
                         new_c.append(max(min_flow_shifted, float(temp1+temp2)))
@@ -369,6 +369,7 @@ class ORCS:
 
 """
 Something is wrong with the shifted_flow: for one od pair, either all demand is controlled or none is controlled
+UE DEMAND IS NEGATIVE!
 """
 
 
@@ -382,9 +383,9 @@ if __name__ == '__main__':
                  gap2=1e-4,
                  gap3=1e-4,
                  gap4=1e-4,
-                 max_iter1=2000,
-                 max_iter2=2000,
-                 max_iter3=3000,
+                 max_iter1=1000,
+                 max_iter2=1000,
+                 max_iter3=1000,
                  max_iter4=1000)
     model.run()
     # demand_pattern = np.array([od.total_demand for od in sf.ODPairs])
