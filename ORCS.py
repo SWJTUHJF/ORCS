@@ -1,8 +1,19 @@
-import pickle
+"""
+The network size and the travel demand have been scaled, scale size may be:
+1. the capacity and the travel demand is divided by 1000.
+2. the free flow time is divided by 100.
+The result still fails to align with the result in the paper.
+However, through checking for many times, we believe that the logic is right.
+Factors leading to the difference may be the scale size.
+"""
+
+
 import re
 import time
 import numpy as np
+import matplotlib.pyplot as plt
 from math import inf
+from matplotlib.ticker import PercentFormatter
 
 
 class Node:
@@ -68,19 +79,22 @@ class ODPair:
 
 
 class Network:
-    def __init__(self, name, sst=1):
+    def __init__(self, name, sst=1, od_scale=1e-3, net_scale=1e-2):
         self.name: str = name
         self.sst = sst  # demand sensitivity
+        self.od_scale = od_scale
+        self.net_scale = net_scale
         self.Nodes: list[Node] = list()
         self.Links: list[Link] = list()
         self.ODPairs: list[ODPair] = list()
         self.num_node: int = 0
         self.num_link: int = 0
+        self.total_flow: float = 0
         self.read_network()
         self.read_OD()
 
     def read_network(self):
-        path = f'D:\\TransportationNetworks\\{self.name}\\{self.name}_net.txt'
+        path = f'{self.name}\\{self.name}_net.txt'
         with open(path, 'r', encoding='UTF-8') as file:
             lines = file.readlines()
         pattern = re.compile(r'[\w.~]+')
@@ -93,20 +107,20 @@ class Network:
         self.Nodes = [Node(i) for i in range(self.num_node + 1)]
         self.Links = [Link(0)]
         for index, line in enumerate(data):
-            cur_link = Link(index + 1, self.Nodes[int(line[0])], self.Nodes[int(line[1])], float(line[2]),
-                            float(line[3]), float(line[4]), float(line[5]), float(line[6]))
+            cur_link = Link(index+1, self.Nodes[int(line[0])], self.Nodes[int(line[1])], float(line[2])*self.od_scale,
+                            float(line[3]), float(line[4])*self.net_scale, float(line[5]), float(line[6]))
             self.Links.append(cur_link)
             self.Nodes[int(line[0])].downstream_link.append(cur_link)
             self.Nodes[int(line[1])].upstream_link.append(cur_link)
 
     def read_OD(self):
-        path = f'D:\\TransportationNetworks\\{self.name}\\{self.name}_trips.txt'
+        path = f'{self.name}\\{self.name}_trips.txt'
         with open(path, 'r', encoding='UTF-8') as file:
             # Process the text file
             lines = file.readlines()
         pattern = re.compile(r'[0-9.]+|Origin')
         data = [pattern.findall(line) for line in lines if len(pattern.findall(line)) != 0]
-        total_flow = float(data[1][0])
+        self.total_flow = float(data[1][0]) * self.od_scale
         for i in range(len(data)):
             if 'Origin' in data[i]:
                 data = data[i:]
@@ -118,13 +132,14 @@ class Network:
                 continue
             for i in range(len(line) // 2):
                 destination = self.Nodes[int(line[2 * i])]
-                demand = float(line[2 * i + 1]) * self.sst
+                demand = float(line[2 * i + 1]) * self.sst * self.od_scale
                 if demand != 0:
                     self.ODPairs.append(ODPair(origin, destination, demand))
-        if abs(total_flow - sum([od.total_demand for od in self.ODPairs])) > 1:
+        if abs(self.total_flow - sum([od.total_demand for od in self.ODPairs])) > 1:
             raise ValueError("Demand in the file doesn't match with the total OD flow.")
 
 
+# Solve the lower problem
 class MixedEquilibrium:
     def __init__(self, network, ue_demand, so_demand, ue_gap, so_gap, FW_max_iter, LS_max_iter):
         self.network: Network = network
@@ -294,6 +309,7 @@ class MixedEquilibrium:
         return shortest_path
 
 
+# Solve the upper problem
 class ORCS:
     def __init__(self, network, control_intensity, penalty_param, control_potential, gap1, gap2, gap3, gap4, max_iter1,
                  max_iter2, max_iter3, max_iter4):
@@ -301,110 +317,119 @@ class ORCS:
         self.control_intensity: float = control_intensity
         self.penalty_param: float = penalty_param
         self.control_potential: float = control_potential
-        self.gap1: float = gap1
-        self.gap2: float = gap2
-        self.gap3: float = gap3
-        self.gap4: float = gap4
-        self.max_iter1: int = max_iter1
-        self.max_iter2: int = max_iter2
-        self.max_iter3: int = max_iter3
-        self.max_iter4: int = max_iter4
+        self.gap1: float = gap1  # UE gap for lower problem
+        self.gap2: float = gap2  # SO gap for upper problem
+        self.gap3: float = gap3  # main gap for ORCS
+        self.gap4: float = gap4  # for ADMM
+        self.max_iter1: int = max_iter1  # Lower problem main loop max iteration
+        self.max_iter2: int = max_iter2  # Lower problem line search max iteration
+        self.max_iter3: int = max_iter3  # Upper problem main loop max iteration
+        self.max_iter4: int = max_iter4  # Upper problem ADMM max iteration
+        self.tstt_list: list = list()
+        self.so_percent_list: list = list()
 
     def run(self):
+        # initialize
         iteration, cur_gap3, num_od = 0, inf, len(self.network.ODPairs)
-        shifted_flow = np.array([0.0 for _ in range(num_od)])
+        shifted_flow = np.zeros(num_od)
         cur_ue_demand = np.array([od.total_demand for od in self.network.ODPairs])
-        cur_so_demand = np.array([0.0 for _ in range(num_od)])
-        lp = MixedEquilibrium(self.network, cur_ue_demand, cur_so_demand, self.gap1, self.gap2, self.max_iter1, self.max_iter2)
-        tstt, ue_flow, so_flow = lp.run()
+        cur_so_demand = np.zeros(num_od)
+        lp = MixedEquilibrium(self.network, cur_ue_demand, cur_so_demand, self.gap1, self.gap2, self.max_iter1,
+                              self.max_iter2)
+        lp.run()
+        # main loop
         while iteration < self.max_iter3 and cur_gap3 > self.gap3:
+            # calculate the approximation of gradient
             for link in self.network.Links[1:]:
                 link.update_cost()
                 link.update_marginal_cost()
             gradient = list()
             for od in self.network.ODPairs:
                 origin, destination = od.origin.node_id, od.destination.node_id
-                ue_path = lp.dijkstra(origin, destination, marginal=False)
-                so_path = lp.dijkstra(origin, destination, marginal=True)
-                ue_mc = sum([link.marginal_cost for link in ue_path])
-                so_mc = sum([link.marginal_cost for link in so_path])
+                ue_mc = sum([link.marginal_cost for link in lp.dijkstra(origin, destination, marginal=False)])
+                so_mc = sum([link.marginal_cost for link in lp.dijkstra(origin, destination, marginal=True)])
                 gradient.append(so_mc-ue_mc)
-            gradient = np.array(gradient)  # sum is 4033
+            gradient = np.array(gradient)
+            # solve the optimal control problem using ADMM
             ADMM_iteration, cur_gap1, cur_gap2 = 0, inf, inf
-            c = np.array([0.0 for _ in range(num_od)])
-            u = np.array([0.0 for _ in range(num_od)])
+            c, u = np.zeros(num_od), np.zeros(num_od)
             new_shifted_flow = c - u - gradient / self.penalty_param
             while ADMM_iteration < self.max_iter4 and (cur_gap1 > self.gap4 or cur_gap2 > self.gap4):
-                new_shifted_flow = c - u - gradient / self.penalty_param  # TODO: NSF increases all the time
+                # update q
+                new_shifted_flow = c - u - gradient / self.penalty_param
+                # update c
                 new_c = list()
                 for i, od in enumerate(self.network.ODPairs):
                     temp1 = new_shifted_flow[i] + u[i]
                     temp2 = self.control_intensity / self.penalty_param
-                    max_flow_shifted = cur_ue_demand[i]
-                    min_flow_shifted = -cur_so_demand[i]
+                    max_flow_shifted, min_flow_shifted = cur_ue_demand[i], -cur_so_demand[i]
                     if temp1 > temp2:
                         new_c.append(min(float(max_flow_shifted), float(temp1-temp2)))
                     elif -temp2 <= temp1 <= temp2:
                         new_c.append(0)
                     else:
                         new_c.append(max(float(min_flow_shifted), float(temp1+temp2)))
+                new_c = np.array(new_c)
+                # update u
                 new_u = u + new_shifted_flow - new_c
-                cur_gap1 = sum(abs(a - b) for a, b in zip(new_shifted_flow, new_c))
-                cur_gap2 = sum(abs(a - b) for a, b in zip(new_c, c))
-                c = new_c
-                u = new_u
+                cur_gap1 = np.linalg.norm(new_shifted_flow-new_c, ord=1)
+                cur_gap2 = np.linalg.norm(new_c-c, ord=1)
+                c, u = new_c, new_u
                 ADMM_iteration += 1
             cur_ue_demand -= new_shifted_flow
             cur_so_demand += new_shifted_flow
+            # solve the new mixed traffic equilibrium
             lp = MixedEquilibrium(self.network, cur_ue_demand, cur_so_demand, self.gap1, self.gap2, self.max_iter1,
                                   self.max_iter2)
             tstt, ue_flow, so_flow = lp.run()
-            cur_gap3 = sum(map(abs, new_shifted_flow))
+            cur_gap3 = np.linalg.norm(new_shifted_flow, ord=1)
             shifted_flow += new_shifted_flow
             iteration += 1
-            print(f'Iteration {iteration}: cur_gap3 = {cur_gap3:.2f},'
-                  f' TSTT = {tstt:.2f}, controlled ratio = {sum(shifted_flow) / 360600:.5f}, total controlled demand = {sum(shifted_flow):.2f}')
-        ue_data = [od.ue_demand for od in self.network.ODPairs]
-        so_data = [od.so_demand for od in self.network.ODPairs]
-        with open("ue.pkl", "wb") as file:
-            pickle.dump(ue_data, file)
-        with open("so.pkl", "wb") as file:
-            pickle.dump(so_data, file)
+            so_percent = sum(shifted_flow) / self.network.total_flow
+            self.tstt_list.append(tstt)
+            self.so_percent_list.append(so_percent)
+            print(f'Iteration {iteration}: cur_gap3 = {cur_gap3:.5f},'
+                  f' TSTT = {tstt:.2f}, controlled ratio = {so_percent:.3f},'
+                  f' total controlled demand = {sum(shifted_flow):.3f}')
 
-
-"""
-Something is wrong with the shifted_flow: for one od pair, either all demand is controlled or none is controlled
-"""
+    def plot_basic_data(self):
+        ue_tstt, so_tstt = 74.80225, 71.94922
+        num_iter = len(self.tstt_list)
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        axes[0].plot(range(1, num_iter + 1), self.tstt_list)
+        axes[0].set_ylabel("Total travel time", fontsize=12)
+        axes[0].set_xlabel("Number of iteration", fontsize=12)
+        axes[0].set_xticks(range(1, num_iter + 1))
+        axes[0].set_ylim(71.8, 75.0)
+        axes[0].set_xticklabels([str(i) for i in range(1, num_iter + 1)])
+        axes[0].hlines(ue_tstt, xmax=num_iter, xmin=1, color="#FFA500", linestyles="--", label="UE")
+        axes[0].hlines(so_tstt, xmax=num_iter, xmin=1, color="green", linestyles="--", label="SO")
+        axes[0].legend(bbox_to_anchor=(0.97, 0.9))
+        axes[1].plot(range(1, num_iter + 1), self.so_percent_list)
+        axes[1].set_ylabel("% of SO users", fontsize=12)
+        axes[1].set_xlabel("Number of iteration", fontsize=12)
+        axes[1].set_xticks(range(1, num_iter + 1))
+        axes[1].set_xticklabels([str(i) for i in range(1, num_iter + 1)])
+        axes[1].yaxis.set_major_formatter(PercentFormatter(1, decimals=0))
+        plt.show()
 
 
 if __name__ == '__main__':
+    s = time.perf_counter()
     sf = Network("SiouxFalls")
-    # model = ORCS(network=sf,
-    #              control_intensity=0.1,
-    #              penalty_param=1,
-    #              control_potential=1,
-    #              gap1=1e-5,
-    #              gap2=1e-5,
-    #              gap3=1e-5,
-    #              gap4=1e-5,
-    #              max_iter1=3000,
-    #              max_iter2=3000,
-    #              max_iter3=3000,
-    #              max_iter4=3000)
-    # model.run()
-    # for link in sf.Links[1:]:
-    #     print(link)
-
-    # demand_pattern = np.array([od.total_demand for od in sf.ODPairs])
-    # with open("ue.pkl", "rb") as f:
-    #     ue_data = np.array(pickle.load(f))
-    # with open("so.pkl", "rb") as f:
-    #     so_data = np.array(pickle.load(f))
-    # for i in [0.1*j for j in range(11)]:
-    #     s = time.perf_counter()
-    #     lower1 = MixedEquilibrium(network=sf, so_demand=so_data, ue_demand=ue_data,
-    #                               ue_gap=1e-5, so_gap=1e-5, FW_max_iter=3000, LS_max_iter=3000)
-    #     tstt, _, _ = lower1.run()
-    #     print(tstt)
-    #     e = time.perf_counter()
-    #     print(e - s)
+    model = ORCS(network=sf,
+                 control_intensity=0.1,
+                 penalty_param=1,
+                 control_potential=1,
+                 gap1=1e-5,
+                 gap2=1e-5,
+                 gap3=1e-5,
+                 gap4=1e-5,
+                 max_iter1=3000,
+                 max_iter2=3000,
+                 max_iter3=3000,
+                 max_iter4=3000)
+    model.run()
+    e = time.perf_counter()
+    model.plot_basic_data()
+    print(f'Total running time: {e-s:.1f}s.')
